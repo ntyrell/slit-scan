@@ -4,14 +4,15 @@ import threading
 import picamera
 from PIL import Image
 import numpy as np
-import matplotlib.pyplot as plt
-from queue import Queue
-from matplotlib.animation import FuncAnimation
+from Queue import Queue
+import cv2
 
-n = 90
+fps = 60 # camera frames per second
+fps_a = 15 # desired update rate of animation, must be an integer divisor of camera fps
+
+n = 30 # buffer size
 qs = [Queue(maxsize=n), Queue(maxsize=n)]
 q_index = 0
-q_flag = 0
 
 class ImageProcessor(threading.Thread):
     def __init__(self, owner):
@@ -41,7 +42,8 @@ class ImageProcessor(threading.Thread):
                     data = np.asarray(im)
                     if qs[q_index].full():
                         q_index = ~q_index
-                        q_flag = 1
+                        t1 = threading.Thread(target=make_frames)
+                        t1.start() # start the frame ordering thread..
                         # there may be conflicts between threads setting the queue flag
                         # consider putting a timestamp on the queue and using it to order the frames during update
                     qs[q_index].put((self.frame_count,data[:,320]))
@@ -60,7 +62,7 @@ class ImageProcessor(threading.Thread):
                     with self.owner.lock:
                         self.owner.pool.append(self)
 
-n_threads = 8
+n_threads = 16
 frame_count = -1
 drop_count = -1
 
@@ -117,59 +119,89 @@ class ProcessOutput(object):
             proc.terminated = True
             proc.join()
 
-data = np.zeros([480,640,3],dtype=np.uint8)
-ax1 = plt.subplot(111)
-im1=ax1.imshow(data)
-
 n2 = int(n/2)
-
 dic = dict()
 dic_prev = dict()
 i_prev = -1
 index = -1
-
-def update(i):
+qf = Queue(maxsize = int(n / (fps/fps_a) + 10))
+def make_frames():
     global data
-    global q_flag
     global dic
     global dic_prev
     global index
     global i_prev
-    if q_flag:
-        q_flag = 0
-        dic = dict()
-        count = 0
+    dic = dict()
+    count = 0
         
-        # could I put the data into a dictionary directly without the queue? can it handle threading?
-        while not qs[~q_index].empty():
-            q_data = qs[~q_index].get()
-            dic[q_data[0]] = q_data[1]
-            if count == n/2:
-                index = q_data[0]
-            count += 1
+    # could I put the data into a dictionary directly without the queue? can it handle threading?
+    while not qs[~q_index].empty():
+        q_data = qs[~q_index].get()
+        dic[q_data[0]] = q_data[1]
+        if count == n/2:
+            index = q_data[0]
+        count += 1
+       
+    #print('index: ' + str(index))
         
-        print('index: ' + str(index))
-        
-        big_dic = {**dic, **dic_prev}
-        dn = 0
-        data_temp = np.zeros([480,0,3],dtype=np.uint8)
-        # sort data_temp and data_temp_prev according to frame counts 
-        for f,s in sorted(big_dic.items()):
-            if f > i_prev and f <= index:
-                data_temp = np.insert(data_temp,0,s,axis=1)
-                dn += 1
-        i_prev = index
-        dic_prev = dic
-        data= np.roll(data,dn,axis=1)
-        data[:,0:dn]= data_temp
-        im1.set_data(data)
+    #big_dic = {**dic, **dic_prev} # doesn't work with python 2
+    big_dic = dic.copy()
+    big_dic.update(dic_prev)
+    dn = 0
+    data_temp = np.zeros([480,0,3],dtype=np.uint8)
+    # sort data_temp and data_temp_prev according to frame counts 
+    for f,s in sorted(big_dic.items()):
+        if f > i_prev and f <= index:
+            data_temp = np.insert(data_temp,0,s,axis=1)
+            dn += 1
+            if dn % int(fps/fps_a) == 0:
+                if not qf.full():
+                    qf.put(data_temp)
+                else:
+	            	print('FRAME QUEUE FILLED!')
 
-fps = 60
+                data_temp = np.zeros([480,0,3],dtype=np.uint8) 
+                if index-dn < 3:
+					index = f
+					break
+    i_prev = index
+    dic_prev = dic	
+
+data = np.zeros([480,640,3],dtype=np.uint8)
 
 with picamera.PiCamera(resolution='VGA', framerate=fps,sensor_mode=7) as camera:
     output = ProcessOutput()
     camera.start_recording(output, format='mjpeg')
-    # need to sample the animation faster than the queue filling rate
-    ani=FuncAnimation(plt.gcf(), update, interval=1000/fps*n/4)
-    plt.show()
+    #ani=FuncAnimation(plt.gcf(), update, interval=1000/fps_a/2, blit=True)
+    #plt.show()
+    #cv2.namedWindow("disp",cv2.WINDOW_AUTOSIZE)
+    #cv2.imshow('frame',data)
+    #processing_time = 0
+    s = 0
+    f = 0
+    fourcc = cv2.cv.CV_FOURCC('D','I','V','X')
+    out = cv2.VideoWriter('output.avi',fourcc,20.0,(640,480))
+    while True:
+     if not qf.empty():
+        print('frame queue size: ' + str(qf.qsize()))
+        
+        data_temp = qf.get()
 
+        dn = data_temp.shape[1]
+        data= np.roll(data,dn,axis=1)
+        data[:,0:dn]= data_temp
+        out.write(data)
+        cv2.imshow('slit-scan',data)
+        f = time.time()
+        wait_time = 1000/fps_a - int(1000*(f-s))
+        if wait_time < 1 or wait_time > 1000/fps_a:
+			wait_time = 1
+        
+        c = cv2.waitKey(wait_time)
+        if c == ord('q'):
+			break
+        s = time.time()
+    out.release()
+    cv2.destroyAllWindows()        
+     		
+        
