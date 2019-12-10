@@ -11,15 +11,31 @@ from flask import Response
 from flask import Flask
 from flask import render_template
 
-fps = 60 # camera frames per second
-fps_a = 15 # desired update rate of animation, must be an integer divisor of camera fps
 
-n = 30 # buffer size
-qs = [Queue(maxsize=n), Queue(maxsize=n)]
-q_index = 0
+class SlitScanParams(object):
+    def __init__(self):
+        self.fps = 60
+        self.fps_a = 15
+        self.n = 30 # buffer size
+        self.qs = [Queue(maxsize=self.n), Queue(maxsize=self.n)]
+        self.q_index = 0
+        self.n_threads = 16
+        self.dic = dict()
+        self.dic_prev = dict()
+        self.i_prev = -1
+        self.index = -1
+        self.frame_count = -1
+        self.drop_count = -1
+        self.qf = Queue(maxsize = int(self.n / (self.fps/self.fps_a) + 10))
+        self.data = np.zeros([480,640,3],dtype=np.uint8)
+        self.lock = threading.Lock()
+        
+p = SlitScanParams()
+app = Flask(__name__)
 
+        
 class ImageProcessor(threading.Thread):
-    def __init__(self, owner):
+    def __init__(self, owner, params):
         super(ImageProcessor, self).__init__()
         self.stream = io.BytesIO()
         self.event = threading.Event()
@@ -27,12 +43,12 @@ class ImageProcessor(threading.Thread):
         self.owner = owner
         self.start()
         self.frame_count = -1;
+        self.params = params # SlitScanParams object
 
     def set_frame_count(self, f):
         self.frame_count = f
     
     def run(self):
-        global q_flag,q_index,qs
         # This method runs in a separate thread
         while not self.terminated:
             # Wait for an image to be written to the stream
@@ -42,13 +58,13 @@ class ImageProcessor(threading.Thread):
                     # Read the image and do some processing on it
                     im = Image.open(self.stream)
                     data = np.asarray(im)
-                    if qs[q_index].full():
-                        q_index = ~q_index
-                        t1 = threading.Thread(target=make_frames)
+                    if self.params.qs[self.params.q_index].full():
+                        self.params.q_index = ~self.params.q_index
+                        t1 = threading.Thread(target=make_frames, args=(self.params,))
                         t1.start() # start the frame ordering thread..
                         # there may be conflicts between threads setting the queue flag
                         # consider putting a timestamp on the queue and using it to order the frames during update
-                    qs[q_index].put((self.frame_count,data[:,320]))
+                    self.params.qs[self.params.q_index].put((self.frame_count,data[:,320]))
                     # print('frame count: '+ str(self.frame_count))
                     #...
                     #...
@@ -64,33 +80,30 @@ class ImageProcessor(threading.Thread):
                     with self.owner.lock:
                         self.owner.pool.append(self)
 
-n_threads = 16
-frame_count = -1
-drop_count = -1
 
 class ProcessOutput(object):
-    def __init__(self):
+    def __init__(self, params):
         self.done = False
         # Construct a pool of 8 image processors along with a lock
         # to control access between threads
         self.lock = threading.Lock()
-        self.pool = [ImageProcessor(self) for i in range(n_threads)]
+        self.pool = [ImageProcessor(self,params) for i in range(params.n_threads)]
         self.processor = None
-
+        self.params = params # SlitScanParams object
+        
     def write(self, buf):
-        global frame_count,drop_count
         if buf.startswith(b'\xff\xd8'):
-            frame_count += 1
+            self.params.frame_count += 1
             # New frame; set the current processor going and grab
             # a spare one
             if self.processor:
-                self.processor.set_frame_count(frame_count)
+                self.processor.set_frame_count(self.params.frame_count)
                 self.processor.event.set()
             else:
-                drop_count += 1
+                self.params.drop_count += 1
                 print('NO PROCESSORS AVAILABLE; dropped frame: ' 
-                      + str(frame_count)
-                      + '; drop count: ' + str(drop_count))
+                      + str(self.params.frame_count)
+                      + '; drop count: ' + str(self.params.drop_count))
             with self.lock:
                 if self.pool:
                     self.processor = self.pool.pop()
@@ -120,64 +133,54 @@ class ProcessOutput(object):
             proc.terminated = True
             proc.join()
 
-n2 = int(n/2)
-dic = dict()
-dic_prev = dict()
-i_prev = -1
-index = -1
-qf = Queue(maxsize = int(n / (fps/fps_a) + 10))
-def make_frames():
-    global data,dic,dic_prev,index,i_prev
-    dic = dict()
+            
+def make_frames(params):
+    params.dic = dict()
     count = 0
         
     # could I put the data into a dictionary directly without the queue? can it handle threading?
-    while not qs[~q_index].empty():
-        q_data = qs[~q_index].get()
-        dic[q_data[0]] = q_data[1]
-        if count == n/2:
-            index = q_data[0]
+    while not params.qs[~params.q_index].empty():
+        q_data = params.qs[~params.q_index].get()
+        params.dic[q_data[0]] = q_data[1]
+        if count == params.n/2:
+            params.index = q_data[0]
         count += 1
        
     #print('index: ' + str(index))
         
     #big_dic = {**dic, **dic_prev} # doesn't work with python 2
-    big_dic = dic.copy()
-    big_dic.update(dic_prev)
+    params.big_dic = params.dic.copy()
+    params.big_dic.update(params.dic_prev)
     dn = 0
     data_temp = np.zeros([480,0,3],dtype=np.uint8)
     # sort data_temp and data_temp_prev according to frame counts 
-    for f,s in sorted(big_dic.items()):
-        if f > i_prev and f <= index:
+    for f,s in sorted(params.big_dic.items()):
+        if f > params.i_prev and f <= params.index:
             data_temp = np.insert(data_temp,0,s,axis=1)
             dn += 1
-            if dn % int(fps/fps_a) == 0:
-                if not qf.full():
-                    qf.put(data_temp)
+            if dn % int(params.fps/params.fps_a) == 0:
+                if not params.qf.full():
+                    params.qf.put(data_temp)
                 else:
 	            	print('FRAME QUEUE FILLED!')
 
                 data_temp = np.zeros([480,0,3],dtype=np.uint8) 
-                if index-dn < 3:
-					index = f
-					break
-    i_prev = index
-    dic_prev = dic	
-
-data = np.zeros([480,640,3],dtype=np.uint8)
-lock = threading.Lock()
-app = Flask(__name__)
+                if params.index-dn < 3:
+		    params.index = f
+		    break
+    params.i_prev = params.index
+    params.dic_prev = params.dic
+    
 
 @app.route("/")
 def index():
 	# return the rendered template
 	return render_template("index.html")
 
-def generate_output_frame(output_flag):
+def generate_output_frame(output_flag, params):
 	# add an argument that toggles video saving, instead of global variable
-	global data,qf,args,lock
-	with picamera.PiCamera(resolution='VGA', framerate=fps,sensor_mode=7) as camera:
-		output = ProcessOutput()
+	with picamera.PiCamera(resolution='VGA', framerate=params.fps,sensor_mode=7) as camera:
+		output = ProcessOutput(params)
 		camera.start_recording(output, format='mjpeg')
 		s = 0
 		f = 0
@@ -185,19 +188,19 @@ def generate_output_frame(output_flag):
 			fourcc = cv2.cv.CV_FOURCC('D','I','V','X')
 			out = cv2.VideoWriter('output.avi',fourcc,20.0,(640,480))
 		while True:
-		 if not qf.empty():
+		 if not params.qf.empty():
 			#print('frame queue size: ' + str(qf.qsize()))
 			
-			data_temp = qf.get()
+			data_temp = params.qf.get()
 
 			dn = data_temp.shape[1]
-			with lock:
-				data= np.roll(data,dn,axis=1)
-				data[:,0:dn]= data_temp
-			if output_flag: out.write(data)
+			with params.lock:
+				params.data= np.roll(data,dn,axis=1)
+				params.data[:,0:dn]= data_temp
+			if output_flag: out.write(params.data)
 			f = time.time()
-			wait_time = 1000/fps_a - int(1000*(f-s))
-			if wait_time < 1 or wait_time > 1000/fps_a:
+			wait_time = 1000/params.fps_a - int(1000*(f-s))
+			if wait_time < 1 or wait_time > 1000/params.fps_a:
 				wait_time = 1
 			
 			c = cv2.waitKey(wait_time)
@@ -207,11 +210,10 @@ def generate_output_frame(output_flag):
 		if output_flag: out.release()    
     
 def generate():
-	global data,lock
 	while True:
-		with lock:
+		with p.lock:
 			# encode the output frame in JPEG format
-			(flag, encodedImage) = cv2.imencode(".jpg",data)
+			(flag, encodedImage) = cv2.imencode(".jpg",p.data)
 			#ensure the frame was successfully encoded
 			if not flag: continue
 		
@@ -240,7 +242,7 @@ if __name__ == '__main__':
 
 
 	t = threading.Thread(target=generate_output_frame, args=(
-		args.output,))
+		args.output,p))
 	t.daemon = True
 	t.start() 	
 	
