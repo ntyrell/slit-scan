@@ -12,9 +12,9 @@ from flask import Flask
 from flask import render_template
 
 fps = 60 # camera frames per second
-fps_a = 15 # desired update rate of animation, must be an integer divisor of camera fps
+fps_a = 10 # desired update rate of animation, must be an integer divisor of camera fps
 
-n = 30 # buffer size
+n = 50 # buffer size
 qs = [Queue(maxsize=n), Queue(maxsize=n)]
 q_index = 0
 
@@ -164,7 +164,7 @@ def make_frames():
     i_prev = index
     dic_prev = dic	
 
-data = np.zeros([480,640,3],dtype=np.uint8)
+data = np.zeros([480,1280,3],dtype=np.uint8)
 lock = threading.Lock()
 app = Flask(__name__)
 
